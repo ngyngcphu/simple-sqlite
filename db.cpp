@@ -152,17 +152,8 @@ public:
         pager = new Pager{ filename };
         num_rows = pager->file_length / ROW_SIZE;
     }
-    void *row_slot(uint32_t row_num);
     ~Table();
 };
-
-void *Table::row_slot(uint32_t row_num) {
-    uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void *page = pager->get_page(page_num);
-    uint32_t row_offset = row_num % ROWS_PER_PAGE;
-    uint32_t byte_offset = row_offset * ROW_SIZE;
-    return (char *)page + byte_offset;
-}
 
 Table::~Table() {
     uint32_t num_full_pages = num_rows / ROWS_PER_PAGE;
@@ -195,6 +186,43 @@ Table::~Table() {
         }
     }
     delete pager;
+}
+
+class Cursor {
+public:
+    Table *table;
+    uint32_t row_num;
+    bool end_of_table;
+
+    Cursor(Table *table, bool option);
+    void *cursor_value();
+    void cursor_advance();
+};
+
+Cursor::Cursor(Table *table, bool option) {
+    this->table = table;
+    if (option) {
+        row_num = 0;
+        end_of_table = (table->num_rows == 0);
+    } else {
+        row_num = table->num_rows;
+        end_of_table = true;
+    }
+}
+
+void *Cursor::cursor_value() {
+    uint32_t page_num = row_num / ROWS_PER_PAGE;
+    void *page = table->pager->get_page(page_num);
+    uint32_t row_offset = row_num % ROWS_PER_PAGE;
+    uint32_t byte_offset = row_offset * ROW_SIZE;
+    return (char *)page + byte_offset;
+}
+
+void Cursor::cursor_advance() {
+    ++row_num;
+    if (row_num >= table->num_rows) {
+        end_of_table = true;
+    }
 }
 
 class Statement {
@@ -298,19 +326,25 @@ ExecuteResult Database::execute_insert(Statement *statement) {
     if (table->num_rows >= TABLE_MAX_ROWS) {
         return EXECUTE_TABLE_FULL;
     }
-    serialize_row(&(statement->row_to_insert), table->row_slot(table->num_rows));
+    Cursor *cursor = new Cursor{table, false};
+    serialize_row(&(statement->row_to_insert), cursor->cursor_value());
     table->num_rows++;
+    delete cursor;
     return EXECUTE_SUCCESS;
 }
 
 ExecuteResult Database::execute_select(Statement *statement) {
     Row *row = new Row{};
-    for (uint32_t i = 0; i < table->num_rows; ++i) {
-        deserialize_row(table->row_slot(i), row);
+    Cursor *cursor = new Cursor{ table, true };
+    while (!(cursor->end_of_table)) {
+        deserialize_row(cursor->cursor_value(), row);
         std::cout << "(" << row->id << ", " << row->username << ", " << row->email << ")" << std::endl;
+        cursor->cursor_advance();
     }
     delete row;
+    delete cursor;
     row = nullptr;
+    cursor = nullptr;
     return EXECUTE_SUCCESS;
 }
 
