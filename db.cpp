@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 #include <iostream>
 #include <cstddef>
 #include <cstdint>
@@ -61,14 +64,14 @@ const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 void serialize_row(Row* source, void *destination) {
     memcpy((char *)destination + ID_OFFSET, &(source->id), ID_SIZE);
-    memcpy((char *)destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-    memcpy((char *)destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+    strncpy((char *)destination + USERNAME_OFFSET, source->username, USERNAME_SIZE);
+    strncpy((char *)destination + EMAIL_OFFSET, source->email, EMAIL_SIZE);
 }
 
 void deserialize_row(void *source, Row *destination) {
     memcpy(&(destination->id), (char *)source + ID_OFFSET, ID_SIZE);
-    memcpy(&(destination->username), (char *)source + USERNAME_OFFSET, USERNAME_SIZE);
-    memcpy(&(destination->email), (char *)source + EMAIL_OFFSET, EMAIL_SIZE);
+    strncpy(destination->username, (char *)source + USERNAME_OFFSET, USERNAME_SIZE);
+    strncpy(destination->email, (char *)source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
 #define TABLE_MAX_PAGES 100
@@ -76,32 +79,122 @@ const uint32_t PAGE_SIZE = 4096;
 const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
+class Pager {
+public:
+    int file_description;
+    uint32_t file_length;
+    void *pages[TABLE_MAX_PAGES];
+
+    Pager(const char *filename);
+    void *get_page(uint32_t page_num);
+    void pager_flush(uint32_t page_num, uint32_t size);
+};
+
+Pager::Pager(const char *filename) {
+    file_description = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+    if (file_description < 0) {
+        std::cerr << "Error: cannot open file " << filename << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    file_length = lseek(file_description, 0, SEEK_END);
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; ++i) {
+        pages[i] = nullptr;
+    }
+}
+
+void *Pager::get_page(uint32_t page_num) {
+    if (page_num > TABLE_MAX_PAGES) {
+        std::cout << "Tried to fetch page number out of bounds. " << page_num << " > "
+                    << TABLE_MAX_PAGES << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    if (pages[page_num] == nullptr) {
+        void *page = malloc(PAGE_SIZE);
+        uint32_t num_pages = file_length / PAGE_SIZE;
+        if (file_length % PAGE_SIZE != 0) {
+            num_pages++;
+        }
+        if (page_num <= num_pages) {
+            lseek(file_description, page_num * PAGE_SIZE, SEEK_SET);
+            ssize_t bytes_read = read(file_description, page, PAGE_SIZE);
+            if (bytes_read == -1) {
+                std::cout << "Error reading file: " << errno << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+        pages[page_num] = page;
+    }
+    return pages[page_num];
+}
+
+void Pager::pager_flush(uint32_t page_num, uint32_t size) {
+    if (pages[page_num] == nullptr) {
+        std::cout << "Tried to flush null page\n";
+        exit(EXIT_FAILURE);
+    }
+    off_t offset = lseek(file_description, page_num * PAGE_SIZE, SEEK_SET);
+    if (offset == -1) {
+        std::cout << "Error seeking: " << errno << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    ssize_t bytes_written = write(file_description, pages[page_num], size);
+    if (bytes_written == -1) {
+        std::cout << "Error writting: " << errno << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
 class Table {
 public:
     uint32_t num_rows;
-    void *pages[TABLE_MAX_PAGES];
-    Table() {
-        num_rows = 0;
-        for (uint32_t i = 0; i < TABLE_MAX_PAGES; ++i) {
-            pages[i] = nullptr;
-        }
+    Pager *pager;
+    Table(const char *filename) {
+        pager = new Pager{ filename };
+        num_rows = pager->file_length / ROW_SIZE;
     }
-    ~Table() {
-        for (uint32_t i = 0; i < TABLE_MAX_PAGES; ++i) {
-            free(pages[i]);
-        }
-    }
+    void *row_slot(uint32_t row_num);
+    ~Table();
 };
 
-void *row_slot(Table *table, uint32_t row_num) {
+void *Table::row_slot(uint32_t row_num) {
     uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void *page = table->pages[page_num];
-    if (page == nullptr) {
-        page = table->pages[page_num] = malloc(PAGE_SIZE);
-    }
+    void *page = pager->get_page(page_num);
     uint32_t row_offset = row_num % ROWS_PER_PAGE;
     uint32_t byte_offset = row_offset * ROW_SIZE;
     return (char *)page + byte_offset;
+}
+
+Table::~Table() {
+    uint32_t num_full_pages = num_rows / ROWS_PER_PAGE;
+    for (uint32_t i = 0; i < num_full_pages; ++i) {
+        if (pager->pages[i] == nullptr) {
+            continue;
+        }
+        pager->pager_flush(i, PAGE_SIZE);
+        free(pager->pages[i]);
+        pager->pages[i] = nullptr;
+    }
+    uint32_t num_addtional_rows = num_rows % ROWS_PER_PAGE;
+    if (num_addtional_rows > 0) {
+        if (pager->pages[num_full_pages] != nullptr) {
+            pager->pager_flush(num_full_pages, num_addtional_rows * ROW_SIZE);
+            free(pager->pages[num_full_pages]);
+            pager->pages[num_full_pages] = nullptr;
+        }
+    }
+    int result = close(pager->file_description);
+    if (result == -1) {
+        std::cout << "Error closing db file.\n";
+        exit(EXIT_FAILURE);
+    }
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; ++i) {
+        void *page = pager->pages[i];
+        if (page) {
+            free(page);
+            pager->pages[i] = nullptr;
+        }
+    }
+    delete pager;
 }
 
 class Statement {
@@ -119,27 +212,28 @@ public:
     InputBuffer(): buffer{nullptr}, buffer_length{0}, input_length{0} {}
     ~InputBuffer() {
         delete[] buffer;
+        buffer = nullptr;
     }
 };
 
 class Database {
+private:
+    Table *table;
+
 public:
+    Database(const char *filename) {
+        table = new Table{ filename };
+    }
     void print_prompt() {
         std::cout << "db > ";
     }
     void read_input(InputBuffer *input_buffer);
-    MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table);
+    MetaCommandResult do_meta_command(InputBuffer *input_buffer);
     PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement);
     PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement);
-    void close_input_buffer(InputBuffer *input_buffer) {
-        delete input_buffer;
-    }
-    void close_table(Table *table) {
-        delete table;
-    }
-    ExecuteResult execute_insert(Statement *statement, Table *table);
-    ExecuteResult execute_select(Statement *statement, Table *table);
-    ExecuteResult execute_statement(Statement *statement, Table *table);
+    ExecuteResult execute_insert(Statement *statement);
+    ExecuteResult execute_select(Statement *statement);
+    ExecuteResult execute_statement(Statement *statement);
     void run();
 };
 
@@ -153,11 +247,13 @@ void Database::read_input(InputBuffer *input_buffer) {
     input_buffer->buffer[bytes_read - 1] = '\0';
 }
 
-MetaCommandResult Database::do_meta_command(InputBuffer *input_buffer, Table *table) {
+MetaCommandResult Database::do_meta_command(InputBuffer *input_buffer) {
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
+        delete input_buffer;
+        delete table;
+        input_buffer = nullptr;
+        table = nullptr;
         std::cout << "Bye!\n";
-        close_input_buffer(input_buffer);
-        close_table(table);
         exit(EXIT_SUCCESS);
     } else {
         return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -198,43 +294,43 @@ PrepareResult Database::prepare_statement(InputBuffer *input_buffer, Statement *
     }
 }
 
-ExecuteResult Database::execute_insert(Statement *statement, Table* table) {
+ExecuteResult Database::execute_insert(Statement *statement) {
     if (table->num_rows >= TABLE_MAX_ROWS) {
         return EXECUTE_TABLE_FULL;
     }
-    serialize_row(&(statement->row_to_insert), row_slot(table, table->num_rows));
+    serialize_row(&(statement->row_to_insert), table->row_slot(table->num_rows));
     table->num_rows++;
     return EXECUTE_SUCCESS;
 }
 
-ExecuteResult Database::execute_select(Statement *statement, Table* table) {
+ExecuteResult Database::execute_select(Statement *statement) {
     Row *row = new Row{};
     for (uint32_t i = 0; i < table->num_rows; ++i) {
-        deserialize_row(row_slot(table, i), row);
+        deserialize_row(table->row_slot(i), row);
         std::cout << "(" << row->id << ", " << row->username << ", " << row->email << ")" << std::endl;
     }
     delete row;
+    row = nullptr;
     return EXECUTE_SUCCESS;
 }
 
-ExecuteResult Database::execute_statement(Statement *statement, Table *table) {
+ExecuteResult Database::execute_statement(Statement *statement) {
     if (statement->type == STATEMENT_INSERT) {
-        return execute_insert(statement, table);
+        return execute_insert(statement);
     } else {
-        return execute_select(statement, table);
+        return execute_select(statement);
     }
 }
 
 void Database::run() {
     InputBuffer *input_buffer = new InputBuffer{};
-    Table *table = new Table{};
     Statement *statement = new Statement{};
 
     while (true) {
         print_prompt();
         read_input(input_buffer);
         if (input_buffer->buffer[0] == '.') {
-            switch (do_meta_command(input_buffer, table)) {
+            switch (do_meta_command(input_buffer)) {
                 case (META_COMMAND_SUCCESS):
                     continue;
                 case (META_COMMAND_UNRECOGNIZED_COMMAND):
@@ -258,7 +354,7 @@ void Database::run() {
                 std::cout << "Unrecognized keyword at start of " << "'" << input_buffer->buffer << "'." << std::endl;
                 continue;
         }
-        switch (execute_statement(statement, table)) {
+        switch (execute_statement(statement)) {
             case (EXECUTE_SUCCESS):
                 std::cout << "Executed.\n";
                 break;
@@ -269,8 +365,12 @@ void Database::run() {
     }
 }
 
-int main() {
-    Database db{};
+int main(int argc, const char *argv[]) {
+    if (argc < 2) {
+        std::cout << "Must supply a database filename." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    Database db{ argv[1] };
     db.run();
     return 0;
 }
